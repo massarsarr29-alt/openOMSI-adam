@@ -9,6 +9,7 @@ description = "Writes OMSI 2 maps (global.cfg, tiles, terrain, AI lists); first 
 omsi-map = { path = "../../crates/omsi-map" }
 anyhow.workspace = true
 clap.workspace = true
+zip.workspace = true
 
 [dev-dependencies]
 omsi-cfg = { path = "../../crates/omsi-cfg" }

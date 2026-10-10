@@ -2,5 +2,6 @@
 //! only (`writer`) and builds a small test map with them (`test_map`); reading ETS 2's
 //! files comes next.
 
+pub mod scs;
 pub mod test_map;
 pub mod writer;
