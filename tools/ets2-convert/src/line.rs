@@ -266,7 +266,7 @@ fn steps(net: &Network, ways: &[(usize, bool)], a: At, b: At) -> Vec<(i64, u32, 
 }
 
 /// The index in `Map::tiles` of the tile under `p` (map coordinates), and `p` in its frame.
-fn tile_at(map: &Map, p: [f64; 2]) -> (usize, [f64; 2]) {
+pub fn tile_at(map: &Map, p: [f64; 2]) -> (usize, [f64; 2]) {
     let (tx, ty) = ((p[0] / TILE).floor() as i32, (p[1] / TILE).floor() as i32);
     let i = map
         .tiles
@@ -489,6 +489,7 @@ pub fn build(map: &mut Map, net: &Network, area: &Area, spec: &LineSpec) -> Repo
                 id,
                 pos: [local[0], local[1], 0.0],
                 heading: s.heading.rem_euclid(360.0),
+                tilt: [0.0; 2],
                 labels: vec![
                     p.name.clone(),
                     "0".into(),

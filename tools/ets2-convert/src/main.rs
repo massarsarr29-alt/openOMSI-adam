@@ -43,6 +43,17 @@ enum Command {
         /// `line::LineSpec::parse`).
         #[arg(long)]
         line: Option<PathBuf>,
+        /// Game files to take the models from, first one first: the map mod, folders or zips
+        /// of extracted files, the game's own archives (def.scs, base.scs...). With at least
+        /// one, the map's model items (signs, trees, buildings) become scenery objects.
+        #[arg(long = "source")]
+        sources: Vec<PathBuf>,
+        /// Folder under `Sceneryobjects` the objects are written to.
+        #[arg(long, default_value = "ets2-idf")]
+        objects: String,
+        /// The OMSI 2 folder (defaults to the one the out folder is in, `<OMSI 2>/maps/x`).
+        #[arg(long)]
+        omsi: Option<PathBuf>,
     },
 }
 
@@ -62,13 +73,23 @@ fn main() -> Result<()> {
             spline,
             name,
             line,
+            sources,
+            objects,
+            omsi,
         } => {
             use ets2_convert::convert::{convert, Area, Options, World};
             let mut world = World::default();
-            for (n, data) in sector_files(&archive)? {
+            for (n, data) in sector_files(&archive, "base")? {
                 let s = ets2_convert::scs::sector::Sector::parse_base(&data)
                     .with_context(|| format!("reading {n}"))?;
                 world.add(s);
+            }
+            if !sources.is_empty() {
+                for (n, data) in sector_files(&archive, "aux")? {
+                    let s = ets2_convert::scs::sector::Sector::parse_aux(&data)
+                        .with_context(|| format!("reading {n}"))?;
+                    world.add(s);
+                }
             }
             let area = match (city, rect) {
                 (Some(city), _) => Area::around(
@@ -117,6 +138,34 @@ fn main() -> Result<()> {
                     println!("{l}");
                 }
             }
+            if !sources.is_empty() {
+                let mut vfs = ets2_convert::scs::vfs::Vfs::default();
+                vfs.add(&archive)?;
+                for s in &sources {
+                    vfs.add(s)?;
+                }
+                let defs = ets2_convert::objects::model_defs(&vfs)?;
+                println!("{} model definitions", defs.len());
+                let mut made = ets2_convert::objects::Objects::new(&vfs, &objects);
+                for l in ets2_convert::objects::place(&mut map, &area, &world, &defs, &mut made) {
+                    println!("{l}");
+                }
+                let root = match omsi {
+                    Some(r) => r,
+                    None => out
+                        .parent()
+                        .and_then(|p| p.parent())
+                        .context("give --omsi: the out folder is not in <OMSI 2>/maps")?
+                        .to_path_buf(),
+                };
+                let dir = root.join("Sceneryobjects").join(&objects);
+                for (name, bytes) in &made.files {
+                    let p = dir.join(name.replace('\\', "/"));
+                    std::fs::create_dir_all(p.parent().unwrap())?;
+                    std::fs::write(&p, bytes).with_context(|| format!("writing {}", p.display()))?;
+                }
+                println!("{} object files written to {}", made.files.len(), dir.display());
+            }
             let splines: usize = map.tiles.iter().map(|t| t.splines.len()).sum();
             map.write(&out)?;
             println!(
@@ -129,9 +178,9 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// The .base files of a map mod archive (or a zip of its map folder), or of a folder its
-/// "map" folder was copied to.
-fn sector_files(archive: &std::path::Path) -> Result<Vec<(String, Vec<u8>)>> {
+/// The sector files (`.base` or `.aux`) of a map mod archive (or a zip of its map folder),
+/// or of a folder its "map" folder was copied to.
+fn sector_files(archive: &std::path::Path, ext: &str) -> Result<Vec<(String, Vec<u8>)>> {
     use std::io::Read;
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     if archive.is_dir() {
@@ -141,7 +190,7 @@ fn sector_files(archive: &std::path::Path) -> Result<Vec<(String, Vec<u8>)>> {
                 let p = e?.path();
                 if p.is_dir() {
                     stack.push(p);
-                } else if p.extension().is_some_and(|x| x == "base") {
+                } else if p.extension().is_some_and(|x| x == ext) {
                     files.push((p.display().to_string(), std::fs::read(&p)?));
                 }
             }
@@ -150,7 +199,7 @@ fn sector_files(archive: &std::path::Path) -> Result<Vec<(String, Vec<u8>)>> {
         let mut zip = zip::ZipArchive::new(std::fs::File::open(archive)?)?;
         let names: Vec<String> = zip
             .file_names()
-            .filter(|n| n.ends_with(".base"))
+            .filter(|n| n.ends_with(&format!(".{ext}")))
             .map(String::from)
             .collect();
         for n in names {
@@ -166,7 +215,7 @@ fn sector_files(archive: &std::path::Path) -> Result<Vec<(String, Vec<u8>)>> {
 fn inspect(archive: &std::path::Path) -> Result<()> {
     use ets2_convert::scs::sector::Sector;
     use std::collections::BTreeMap;
-    let files = sector_files(archive)?;
+    let files = sector_files(archive, "base")?;
     let (mut ok, mut failed) = (0, 0);
     let mut types: BTreeMap<u32, usize> = BTreeMap::new();
     let (mut roads, mut prefabs, mut nodes, mut stops) = (0, 0, 0, 0);

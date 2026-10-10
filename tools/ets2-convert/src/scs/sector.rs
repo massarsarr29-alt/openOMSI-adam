@@ -4,7 +4,7 @@
 
 use super::reader::Reader;
 use super::token::Token;
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use std::collections::BTreeMap;
 
 /// Map format versions this reader follows: 901 (ETS 2 1.51-1.54) to 907 (1.59-1.61).
@@ -66,6 +66,16 @@ pub struct Sign {
     pub texts: Vec<String>,
 }
 
+/// A model item: a 3D object standing on a node, turned as the node is.
+#[derive(Debug, Clone)]
+pub struct Model {
+    pub model: Token,
+    pub look: Token,
+    pub variant: Token,
+    pub node: u64,
+    pub scale: [f32; 3],
+}
+
 /// A rectangle marking part of the map as a city (centred on its node).
 #[derive(Debug, Clone)]
 pub struct City {
@@ -84,9 +94,12 @@ pub struct Sector {
     pub bus_stops: Vec<(u64, u64)>,
     pub cities: Vec<City>,
     pub signs: Vec<Sign>,
+    pub models: Vec<Model>,
     pub nodes: BTreeMap<u64, Node>,
     /// How many items of each type the file has.
     pub item_counts: BTreeMap<u32, usize>,
+    /// Items stepped over in an `.aux` file because their type is not known here.
+    pub skipped: usize,
 }
 
 struct KdopItem {
@@ -395,9 +408,74 @@ fn item(r: &mut Reader, s: &mut Sector, ty: u32, k: KdopItem) -> Result<()> {
         }
         // Model: model, look, variant, parts, node, scale, terrain material, colour, rotation
         5 => {
-            r.skip(3 * 8)?;
+            let model = r.token()?;
+            let look = r.token()?;
+            let variant = r.token()?;
             r.tokens()?;
-            r.skip(8 + 12 + 8 + 4 + 4)?;
+            let node = r.u64()?;
+            let scale = [r.f32()?, r.f32()?, r.f32()?];
+            r.skip(8 + 4 + 4)?;
+            s.models.push(Model {
+                model,
+                look,
+                variant,
+                node,
+                scale,
+            });
+        }
+        // Mover: tags, model, look, variant, speed, end delay, width, count, lengths, nodes
+        9 => {
+            r.tokens()?;
+            r.skip(3 * 8 + 4 * 4)?;
+            let n = r.count(4)?;
+            r.skip(n * 4)?;
+            r.u64s()?;
+        }
+        // No Weather Area: width, height, fog behaviour and the rest, node
+        11 => r.skip(4 + 4 + 20 + 8)?,
+        // Compound: its node, then whole items and the nodes they stand on
+        40 => {
+            r.u64()?;
+            let items = r.count(57)?;
+            for _ in 0..items {
+                let ty = r.u32()?;
+                let k = kdop_item(r)?;
+                item(r, s, ty, k).with_context(|| format!("compound child of type {ty}"))?;
+            }
+            nodes(r, s)?;
+        }
+        // Far Model: width, height, flags, the items it parents, its nodes
+        43 => {
+            r.skip(4 + 4 + 4)?;
+            r.u64s()?;
+            r.u64s()?;
+        }
+        // Camera Point: tags, node
+        23 => {
+            r.tokens()?;
+            r.u64()?;
+        }
+        // Camera Path: tags, nodes, two lists seen empty, keyframes, speed
+        45 => {
+            r.tokens()?;
+            r.u64s()?;
+            ensure!(r.u32()? == 0 && r.u32()? == 0, "camera path with unknown parts");
+            let n = r.count(40)?;
+            r.skip(n * 40 + 4)?;
+        }
+        // Hookup: name, node
+        47 => {
+            let n = r.u64()? as usize;
+            r.skip(n + 8)?;
+        }
+        // Gate: model, nodes, two activation points (trigger name, node index)
+        49 => {
+            r.token()?;
+            r.u64s()?;
+            for _ in 0..2 {
+                let n = r.u64()? as usize;
+                r.skip(n + 4)?;
+            }
         }
         // Bezier Patch: control points, tessellation, node, seed, vegetation, quads
         39 => {
@@ -434,8 +512,91 @@ fn item(r: &mut Reader, s: &mut Sector, ty: u32, k: KdopItem) -> Result<()> {
     Ok(())
 }
 
+/// A node list: uid, position, rotation, the items behind and ahead, flags.
+fn nodes(r: &mut Reader, s: &mut Sector) -> Result<()> {
+    let n = r.count(8 + 12 + 16 + 16 + 4)?;
+    for _ in 0..n {
+        let uid = r.u64()?;
+        let pos = [
+            r.i32()? as f64 / 256.0,
+            r.i32()? as f64 / 256.0,
+            r.i32()? as f64 / 256.0,
+        ];
+        let rot = [r.f32()?, r.f32()?, r.f32()?, r.f32()?];
+        let backward_item = r.u64()?;
+        let forward_item = r.u64()?;
+        let flags = r.u32()?;
+        s.nodes.insert(
+            uid,
+            Node {
+                uid,
+                pos,
+                rot,
+                backward_item,
+                forward_item,
+                flags,
+            },
+        );
+    }
+    Ok(())
+}
+
+/// Whether the rest of the file from `at` is exactly a node list and a visibility list.
+fn node_list_at(data: &[u8], at: usize) -> bool {
+    let u32at = |i: usize| data.get(i..i + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize);
+    let Some(n) = u32at(at) else { return false };
+    let vis = at + 4 + n * 56;
+    u32at(vis).is_some_and(|k| vis + 4 + k * 8 == data.len())
+}
+
+/// Where the next item starts after an unknown one at `from`: the first place from which
+/// three items in a row (or all up to the node list) read cleanly.
+fn resync(data: &[u8], version: u32, from: usize) -> Option<usize> {
+    const KNOWN: [u32; 14] = [1, 2, 5, 9, 11, 23, 36, 39, 40, 43, 44, 45, 47, 49];
+    let limit = (from + 200_000).min(data.len().saturating_sub(57));
+    (from..limit).find(|&j| {
+        let ty = u32::from_le_bytes(data[j..j + 4].try_into().unwrap());
+        if !KNOWN.contains(&ty) {
+            return false;
+        }
+        let mut r = Reader::new(data);
+        r.pos = j;
+        (0..3).all(|_| {
+            let mut scratch = Sector { version, ..Default::default() };
+            (|| -> Result<()> {
+                let ty = r.u32()?;
+                ensure!(KNOWN.contains(&ty), "not an item");
+                let k = kdop_item(&mut r)?;
+                item(&mut r, &mut scratch, ty, k)
+            })()
+            .is_ok()
+        })
+    })
+}
+
 impl Sector {
+    /// Takes in what a scratch sector read.
+    fn absorb(&mut self, o: Sector) {
+        self.roads.extend(o.roads);
+        self.prefabs.extend(o.prefabs);
+        self.bus_stops.extend(o.bus_stops);
+        self.cities.extend(o.cities);
+        self.signs.extend(o.signs);
+        self.models.extend(o.models);
+        self.nodes.extend(o.nodes);
+    }
+
     pub fn parse_base(data: &[u8]) -> Result<Sector> {
+        Self::parse(data, false)
+    }
+
+    /// A sector's `.aux` file has the same layout as its `.base`, with scenery items. Items
+    /// of a type this reader does not know are stepped over.
+    pub fn parse_aux(data: &[u8]) -> Result<Sector> {
+        Self::parse(data, true)
+    }
+
+    fn parse(data: &[u8], lenient: bool) -> Result<Sector> {
         let mut r = Reader::new(data);
         let version = r.u32()?;
         if !VERSIONS.contains(&version) {
@@ -457,47 +618,38 @@ impl Sector {
         let mut read: Vec<(u32, usize)> = Vec::new();
         for i in 0..items {
             let at = r.pos;
+            if lenient && node_list_at(data, at) {
+                // fewer items than the count says (seen in a few .aux files)
+                break;
+            }
             let ty = r.u32()?;
             let k = kdop_item(&mut r)?;
-            item(&mut r, &mut s, ty, k).with_context(|| {
-                let before: Vec<String> = read
-                    .iter()
-                    .rev()
-                    .take(3)
-                    .map(|(t, p)| format!("type {t} at {p}"))
-                    .collect();
-                format!(
-                    "item {i} of {items} (type {ty}) at byte {at}, after {}",
-                    before.join(", ")
-                )
-            })?;
+            let mut scratch = Sector { version, ..Default::default() };
+            let res = item(&mut r, &mut scratch, ty, k);
+            if res.is_ok() {
+                s.absorb(scratch);
+            } else if let Some(next) = lenient.then(|| resync(data, version, at + 57)).flatten() {
+                // an item this reader does not know: carry on from the next one it can read
+                s.skipped += 1;
+                r.pos = next;
+            } else {
+                res.with_context(|| {
+                    let before: Vec<String> = read
+                        .iter()
+                        .rev()
+                        .take(3)
+                        .map(|(t, p)| format!("type {t} at {p}"))
+                        .collect();
+                    format!(
+                        "item {i} of {items} (type {ty}) at byte {at}, after {}",
+                        before.join(", ")
+                    )
+                })?;
+            }
             read.push((ty, at));
             *s.item_counts.entry(ty).or_default() += 1;
         }
-        let nodes = r.count(8 + 12 + 16 + 16 + 4).context("node list")?;
-        for _ in 0..nodes {
-            let uid = r.u64()?;
-            let pos = [
-                r.i32()? as f64 / 256.0,
-                r.i32()? as f64 / 256.0,
-                r.i32()? as f64 / 256.0,
-            ];
-            let rot = [r.f32()?, r.f32()?, r.f32()?, r.f32()?];
-            let backward_item = r.u64()?;
-            let forward_item = r.u64()?;
-            let flags = r.u32()?;
-            s.nodes.insert(
-                uid,
-                Node {
-                    uid,
-                    pos,
-                    rot,
-                    backward_item,
-                    forward_item,
-                    flags,
-                },
-            );
-        }
+        nodes(&mut r, &mut s).context("node list")?;
         let vis = r.count(8)?;
         r.skip(vis * 8)?;
         if r.remaining() != 0 {

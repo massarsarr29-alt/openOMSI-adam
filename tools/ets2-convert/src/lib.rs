@@ -4,6 +4,7 @@
 
 pub mod convert;
 pub mod line;
+pub mod objects;
 pub mod scs;
 pub mod test_map;
 pub mod writer;

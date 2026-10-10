@@ -61,6 +61,8 @@ pub struct Object {
     pub id: i64,
     pub pos: [f64; 3],
     pub heading: f64,
+    /// Pitch and bank, degrees, as the map file keeps them (Direct3D's senses of rotation).
+    pub tilt: [f64; 2],
     /// What the editor's Labels dialog shows: a bus stop's name and timetable data.
     pub labels: Vec<String>,
 }
@@ -222,7 +224,7 @@ fn ansi(text: &str) -> Vec<u8> {
 }
 
 impl Map {
-    fn next_id(&self) -> i64 {
+    pub fn next_id(&self) -> i64 {
         self.tiles
             .iter()
             .flat_map(|t| {
@@ -311,13 +313,15 @@ impl Map {
         for o in &tile.objects {
             let _ = writeln!(
                 s,
-                "[object]\n0\n{}\n{}\n{}\n{}\n{}\n{}\n0\n0\n{}",
+                "[object]\n0\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
                 o.file,
                 o.id,
                 o.pos[0],
                 o.pos[1],
                 o.pos[2],
                 o.heading,
+                o.tilt[0],
+                o.tilt[1],
                 o.labels.len()
             );
             for l in &o.labels {

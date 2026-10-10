@@ -9,7 +9,7 @@
 //! ways through with the road spline, every other turn with an invisible helper spline that
 //! is only put on the map where a bus line needs it (see `line`).
 
-use crate::scs::sector::{City, Node, Prefab, Road, Sector};
+use crate::scs::sector::{City, Model, Node, Prefab, Road, Sector};
 use crate::writer::{AiGroup, EntryPoint, Map, Spline, Tile};
 use omsi_map::terrain::Terrain;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -23,6 +23,8 @@ pub struct World {
     pub roads: Vec<Road>,
     pub prefabs: Vec<Prefab>,
     pub cities: Vec<City>,
+    /// Model items (from the `.aux` files): signs, trees, buildings, junction surfaces.
+    pub models: Vec<Model>,
 }
 
 impl World {
@@ -31,6 +33,7 @@ impl World {
         self.roads.extend(s.roads);
         self.prefabs.extend(s.prefabs);
         self.cities.extend(s.cities);
+        self.models.extend(s.models);
     }
 
     /// The middle of all city areas with this name, in ETS 2 coordinates (x, z).
@@ -90,7 +93,7 @@ impl Area {
 
 /// A node's direction in the OMSI frame. Node rotations are quaternions (w, x, y, z) that
 /// turn ETS 2's forward axis, -z, into the direction the node points.
-fn direction(n: &Node) -> [f64; 3] {
+pub fn direction(n: &Node) -> [f64; 3] {
     let [w, x, y, z] = n.rot.map(f64::from);
     // the rotated -z axis
     let f = [
