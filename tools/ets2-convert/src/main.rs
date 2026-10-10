@@ -17,13 +17,16 @@ enum Command {
     /// Reads every sector of a map mod (.scs/.zip, or a folder with its map folder) and says
     /// what it holds.
     Inspect { archive: PathBuf },
-    /// Converts the roads around an ETS 2 city into an OMSI map folder.
+    /// Converts the roads around an ETS 2 city, or in a rectangle, into an OMSI map folder.
     Convert {
         archive: PathBuf,
         out: PathBuf,
         /// City name as the map defines it, e.g. "vincennes".
-        #[arg(long)]
-        city: String,
+        #[arg(long, required_unless_present = "rect")]
+        city: Option<String>,
+        /// A rectangle in ETS 2 coordinates instead of a city: "min_x,min_z,max_x,max_z".
+        #[arg(long, conflicts_with = "city")]
+        rect: Option<String>,
         /// Width of the converted square, in 300 m tiles.
         #[arg(long, default_value_t = 5)]
         tiles: u32,
@@ -50,6 +53,7 @@ fn main() -> Result<()> {
             archive,
             out,
             city,
+            rect,
             tiles,
             spline,
             name,
@@ -61,9 +65,27 @@ fn main() -> Result<()> {
                     .with_context(|| format!("reading {n}"))?;
                 world.add(s);
             }
-            let centre = world
-                .city_centre(&city)
-                .with_context(|| format!("no city called {city} in the map"))?;
+            let area = match (city, rect) {
+                (Some(city), _) => Area::around(
+                    world
+                        .city_centre(&city)
+                        .with_context(|| format!("no city called {city} in the map"))?,
+                    tiles,
+                ),
+                (None, Some(rect)) => {
+                    let v: Vec<f64> = rect
+                        .split(',')
+                        .map(|v| v.trim().parse())
+                        .collect::<Result<_, _>>()
+                        .context("--rect wants four numbers")?;
+                    anyhow::ensure!(v.len() == 4, "--rect wants four numbers");
+                    Area {
+                        min: [v[0], v[1]],
+                        max: [v[2], v[3]],
+                    }
+                }
+                (None, None) => unreachable!("clap requires one"),
+            };
             let name = name.unwrap_or_else(|| {
                 out.file_name()
                     .map_or("ets2".into(), |n| n.to_string_lossy().into_owned())
@@ -72,7 +94,7 @@ fn main() -> Result<()> {
                 &world,
                 &Options {
                     name,
-                    area: Area::around(centre, tiles),
+                    area,
                     road_spline: spline,
                 },
             );
