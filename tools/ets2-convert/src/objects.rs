@@ -200,13 +200,34 @@ impl<'a> Objects<'a> {
                 let next = used.len() as u16;
                 let m = *used.entry(piece.material).or_insert(next);
                 let first = vertices.len() as u32;
+                // a tiled material on a scaled model keeps its texel size: the texture repeats
+                // over the stretched faces instead of stretching with them
+                let tile = (scale != [100; 3] && mat.texture.as_deref().is_some_and(|t| t.starts_with("/material/tiled/")))
+                    .then(|| texel_density(piece))
+                    .flatten();
                 for (k, p) in piece.positions.iter().enumerate() {
                     let n = piece.normals.get(k).copied().unwrap_or([0.0, 1.0, 0.0]);
                     let uv = piece.uvs.get(k).copied().unwrap_or([0.0, 0.0]);
                     // a scaled model's normals scale by the inverse
                     let n = [n[0] / sc[0], n[1] / sc[1], n[2] / sc[2]];
                     let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-6);
-                    vertices.push([p[0] * sc[0], p[1] * sc[1], -p[2] * sc[2], n[0] / l, n[1] / l, -n[2] / l, uv[0], uv[1]]);
+                    let q = [p[0] * sc[0], p[1] * sc[1], p[2] * sc[2]];
+                    let uv = match tile {
+                        Some(k) => {
+                            // the face's plane: the two axes across its normal's largest one
+                            let a = [n[0].abs(), n[1].abs(), n[2].abs()];
+                            let (u, v) = if a[1] >= a[0] && a[1] >= a[2] {
+                                (q[0], q[2])
+                            } else if a[0] >= a[2] {
+                                (q[2], -q[1])
+                            } else {
+                                (q[0], -q[1])
+                            };
+                            [u * k, v * k]
+                        }
+                        None => uv,
+                    };
+                    vertices.push([q[0], q[1], -q[2], n[0] / l, n[1] / l, -n[2] / l, uv[0], uv[1]]);
                 }
                 for t in piece.indices.chunks_exact(3) {
                     let t = [first + t[0], first + t[1], first + t[2]];
@@ -465,6 +486,32 @@ fn angles(q: [f32; 4]) -> [f64; 3] {
         }
     };
     [(-alpha.to_degrees()).rem_euclid(360.0), tidy(gamma), tidy(beta)]
+}
+
+/// Texture repeats per metre of a piece as modelled: the median over its triangles of the
+/// length of an edge in texture space over its length in model space.
+fn texel_density(piece: &crate::scs::model::Piece) -> Option<f32> {
+    if piece.uvs.len() != piece.positions.len() {
+        return None;
+    }
+    let mut r: Vec<f32> = piece
+        .indices
+        .chunks_exact(3)
+        .flat_map(|t| [(t[0], t[1]), (t[1], t[2])])
+        .filter_map(|(a, b)| {
+            let (a, b) = (a as usize, b as usize);
+            let (p, q) = (piece.positions[a], piece.positions[b]);
+            let d = ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt();
+            let (s, t) = (piece.uvs[a], piece.uvs[b]);
+            let du = ((s[0] - t[0]).powi(2) + (s[1] - t[1]).powi(2)).sqrt();
+            (d > 1e-3 && du > 1e-4).then(|| du / d)
+        })
+        .collect();
+    if r.is_empty() {
+        return None;
+    }
+    r.sort_by(f32::total_cmp);
+    Some(r[r.len() / 2])
 }
 
 /// The triangle wound so that `(b-a)×(c-a)` points along its vertices' normals.

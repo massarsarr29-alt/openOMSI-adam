@@ -260,10 +260,18 @@ impl Material {
         Material { effect, texture, diffuse }
     }
 
-    /// Effects that draw nothing seen in daylight: shadow casters, collision, flares.
+    /// Effects that draw nothing seen in daylight, or that OMSI cannot draw the way the game
+    /// does: shadow casters, collision, flares, night lights, additive glows (their black
+    /// ground would show) and glass (an opaque dark pane over the window behind it).
     pub fn invisible(&self) -> bool {
         let e = &self.effect;
-        e.contains("shadowonly") || e.contains("none.rfx") || e.contains("flare") || e.is_empty()
+        e.contains("shadowonly")
+            || e.contains("none.rfx")
+            || e.contains("flare")
+            || e.contains(".night")
+            || e.contains(".add.rfx")
+            || e.contains("glass")
+            || e.is_empty()
     }
 
     /// The texture has an alpha channel to cut out (`.a.` effects) or blend (`.over`).
