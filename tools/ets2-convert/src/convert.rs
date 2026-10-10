@@ -5,12 +5,14 @@
 //! circular arcs, so each curve is sampled and the samples are joined by arcs, each arc
 //! leaving in the direction the previous one arrived: the chain is smooth and passes
 //! through every sample. Prefabs (junctions, roundabouts) are not drawn yet; their nodes
-//! are joined by the same kind of curves so the road network stays connected.
+//! are joined by the same kind of curves so the road network stays connected: the main
+//! ways through with the road spline, every other turn with an invisible helper spline that
+//! is only put on the map where a bus line needs it (see `line`).
 
 use crate::scs::sector::{City, Node, Prefab, Road, Sector};
 use crate::writer::{AiGroup, EntryPoint, Map, Spline, Tile};
 use omsi_map::terrain::Terrain;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub const TILE: f64 = 300.0;
 
@@ -68,17 +70,17 @@ impl Area {
         }
     }
 
-    fn contains(&self, p: &[f64; 3]) -> bool {
+    pub fn contains(&self, p: &[f64; 3]) -> bool {
         (self.min[0]..=self.max[0]).contains(&p[0]) && (self.min[1]..=self.max[1]).contains(&p[2])
     }
 
     /// From ETS 2 (x east, y up, z south) to the OMSI map frame (x east, y north, z up),
     /// with the south-west corner of the area at 0, 0.
-    fn to_omsi(self, p: [f64; 3]) -> [f64; 3] {
+    pub fn to_omsi(self, p: [f64; 3]) -> [f64; 3] {
         [p[0] - self.min[0], self.max[1] - p[2], p[1]]
     }
 
-    fn tiles(&self) -> (i32, i32) {
+    pub fn tiles(&self) -> (i32, i32) {
         (
             ((self.max[0] - self.min[0]) / TILE).ceil() as i32,
             ((self.max[1] - self.min[1]) / TILE).ceil() as i32,
@@ -112,12 +114,12 @@ fn len2(a: [f64; 3]) -> f64 {
 }
 
 /// OMSI heading of a direction: degrees, 0 = north, clockwise.
-fn heading(d: [f64; 3]) -> f64 {
+pub fn heading(d: [f64; 3]) -> f64 {
     d[0].atan2(d[1]).to_degrees()
 }
 
 /// Wraps an angle in degrees into -180..180.
-fn wrap(a: f64) -> f64 {
+pub fn wrap(a: f64) -> f64 {
     (a + 180.0).rem_euclid(360.0) - 180.0
 }
 
@@ -216,7 +218,72 @@ pub struct Options {
     pub area: Area,
     /// The spline every road is drawn with, relative to the OMSI root.
     pub road_spline: String,
+    /// The invisible spline of the turns through junctions that are not drawn, relative to
+    /// the OMSI root (see `writer::HELPER_SPLINE`).
+    pub helper_spline: String,
 }
+
+/// A way to drive from one node to another: a converted road, or a way through a junction.
+#[derive(Debug, Clone)]
+pub struct Link {
+    pub from: u64,
+    pub to: u64,
+    /// Its splines from `from` to `to` in map coordinates (not the tile's), each with the
+    /// index of its tile in `Map::tiles`.
+    pub pieces: Vec<(usize, Spline)>,
+    /// Drawn with the road spline; otherwise a helper spline, on the map only once `place`
+    /// puts it there.
+    pub visible: bool,
+}
+
+impl Link {
+    pub fn length(&self) -> f64 {
+        self.pieces.iter().map(|(_, s)| s.length).sum()
+    }
+
+    /// The path of its splines a vehicle drives along, forwards (from `from` to `to`) or
+    /// backwards: the right-hand lane either way.
+    pub fn path(&self, forward: bool) -> u32 {
+        match (self.visible, forward) {
+            // Seeburger street: 0 and 3 are the pavements
+            (true, true) => 2,
+            (true, false) => 1,
+            (false, true) => 1,
+            (false, false) => 0,
+        }
+    }
+}
+
+/// The ways the converted roads give, for routing bus lines on.
+#[derive(Debug, Clone, Default)]
+pub struct Network {
+    pub links: Vec<Link>,
+    /// The made-up nodes halfway round the U-turns through junctions (see `junction`).
+    pub turnarounds: HashSet<u64>,
+}
+
+impl Network {
+    /// Puts the splines of a helper link on the map (once).
+    pub fn place(&self, map: &mut Map, link: usize) {
+        let l = &self.links[link];
+        if l.visible {
+            return;
+        }
+        for (t, s) in &l.pieces {
+            let tile = &mut map.tiles[*t];
+            if tile.splines.iter().any(|x| x.id == s.id) {
+                continue;
+            }
+            let mut s = s.clone();
+            s.pos[0] -= tile.x as f64 * TILE;
+            s.pos[1] -= tile.y as f64 * TILE;
+            tile.splines.push(s);
+        }
+    }
+}
+
+/// A curve to convert: from node, to node, the curve, and whether it is drawn.
+type Way = (u64, u64, Curve, bool);
 
 /// One end of a converted road or connector: which spline, and whether it is its start.
 #[derive(Clone, Copy)]
@@ -225,9 +292,9 @@ struct End {
     start: bool,
 }
 
-pub fn convert(world: &World, opt: &Options) -> Map {
+pub fn convert(world: &World, opt: &Options) -> (Map, Network) {
     let area = opt.area;
-    let mut curves: Vec<(u64, u64, Curve)> = Vec::new();
+    let mut curves: Vec<Way> = Vec::new();
     let pos = |n: &Node| area.to_omsi(n.pos);
     for r in &world.roads {
         let (Some(a), Some(b)) = (world.nodes.get(&r.start_node), world.nodes.get(&r.end_node))
@@ -255,17 +322,27 @@ pub fn convert(world: &World, opt: &Options) -> Map {
                 p1: pos(b),
                 d1: orient(direction(b)),
             },
+            true,
         ));
     }
+    let mut turnarounds = HashSet::new();
     for p in &world.prefabs {
-        curves.extend(junction(world, &area, p));
+        let (c, turns) = junction(world, &area, p);
+        curves.extend(c);
+        turnarounds.extend(turns);
     }
 
     // every curve becomes a chain of splines with ids from 1
     let mut all: Vec<Spline> = Vec::new();
     let mut ends: BTreeMap<u64, Vec<End>> = BTreeMap::new();
-    for (from, to, c) in &curves {
-        let chain = c.splines(&opt.road_spline);
+    let mut chains: Vec<(u64, u64, std::ops::Range<usize>, bool)> = Vec::new();
+    for (from, to, c, visible) in &curves {
+        let file = if *visible {
+            &opt.road_spline
+        } else {
+            &opt.helper_spline
+        };
+        let chain = c.splines(file);
         if chain.is_empty() {
             continue;
         }
@@ -280,6 +357,10 @@ pub fn convert(world: &World, opt: &Options) -> Map {
             s.tex_offset = offset;
             offset += s.length;
             all.push(s);
+        }
+        chains.push((*from, *to, first..all.len(), *visible));
+        if !visible {
+            continue;
         }
         ends.entry(*from).or_default().push(End {
             spline: first,
@@ -315,16 +396,40 @@ pub fn convert(world: &World, opt: &Options) -> Map {
             })
         })
         .collect();
-    let tile_of = |p: [f64; 3]| -> Option<usize> {
-        let (tx, ty) = ((p[0] / TILE).floor() as i32, (p[1] / TILE).floor() as i32);
-        ((0..nx).contains(&tx) && (0..ny).contains(&ty)).then_some((ty * nx + tx) as usize)
+    // (a curve bulging out of the area stays on the edge tile, beyond its edge)
+    let tile_of = |p: [f64; 3]| -> usize {
+        let tx = ((p[0] / TILE).floor() as i32).clamp(0, nx - 1);
+        let ty = ((p[1] / TILE).floor() as i32).clamp(0, ny - 1);
+        (ty * nx + tx) as usize
     };
-    let samples: Vec<[f64; 3]> = all.iter().map(|s| s.pos).collect();
-    for mut s in all {
-        let Some(t) = tile_of(s.pos) else { continue };
-        s.pos[0] -= tiles[t].x as f64 * TILE;
-        s.pos[1] -= tiles[t].y as f64 * TILE;
-        tiles[t].splines.push(s);
+    let network = Network {
+        links: chains
+            .into_iter()
+            .map(|(from, to, range, visible)| Link {
+                from,
+                to,
+                pieces: all[range]
+                    .iter()
+                    .map(|s| (tile_of(s.pos), s.clone()))
+                    .collect(),
+                visible,
+            })
+            .collect(),
+        turnarounds,
+    };
+    let samples: Vec<[f64; 3]> = network
+        .links
+        .iter()
+        .filter(|l| l.visible)
+        .flat_map(|l| l.pieces.iter().map(|(_, s)| s.pos))
+        .collect();
+    for l in network.links.iter().filter(|l| l.visible) {
+        for (t, s) in &l.pieces {
+            let mut s = s.clone();
+            s.pos[0] -= tiles[*t].x as f64 * TILE;
+            s.pos[1] -= tiles[*t].y as f64 * TILE;
+            tiles[*t].splines.push(s);
+        }
     }
     for t in &mut tiles {
         t.terrain = Some(terrain(t, &samples));
@@ -349,20 +454,10 @@ pub fn convert(world: &World, opt: &Options) -> Map {
             d(*i, a).total_cmp(&d(*j, b))
         })
     {
-        let h = s.heading.to_radians();
-        entry_points.push(EntryPoint {
-            name: "Start".into(),
-            tile: ti,
-            pos: [
-                s.pos[0] + 2.0 * h.cos(),
-                s.pos[1] - 2.0 * h.sin(),
-                s.pos[2] + 0.5,
-            ],
-            heading: s.heading,
-        });
+        entry_points.push(EntryPoint::beside("Start", ti, s));
     }
 
-    Map {
+    let map = Map {
         name: opt.name.clone(),
         friendly_name: opt.name.clone(),
         description: "Roads converted from an ETS 2 map by ets2-convert.".into(),
@@ -377,12 +472,17 @@ pub fn convert(world: &World, opt: &Options) -> Map {
                 ("vehicles\\Citr_BX\\BX.ovh".into(), 40),
             ],
         }],
-    }
+        ..Default::default()
+    };
+    (map, network)
 }
 
 /// Curves across a prefab joining its nodes: first the pairs that run nearly straight
-/// through, then every node left over to the node it turns least towards.
-fn junction(world: &World, area: &Area, p: &Prefab) -> Vec<(u64, u64, Curve)> {
+/// through, then every node left over to the node it turns least towards - these are drawn.
+/// Every other turn that is not a U-turn gets a hidden curve. A junction of four ways or
+/// more may be a roundabout, so it has hidden U-turns as well: from each node round the
+/// middle and back, through a made-up node beyond the middle (returned too).
+fn junction(world: &World, area: &Area, p: &Prefab) -> (Vec<Way>, Vec<u64>) {
     let nodes: Vec<(u64, [f64; 3], [f64; 3])> = p
         .nodes
         .iter()
@@ -396,7 +496,7 @@ fn junction(world: &World, area: &Area, p: &Prefab) -> Vec<(u64, u64, Curve)> {
         })
         .collect();
     if nodes.len() < 2 || nodes.len() > 8 {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let turn = |i: usize, j: usize| wrap(heading(nodes[i].2) - heading(neg(nodes[j].2))).abs();
     let mut pairs: Vec<(usize, usize)> = (0..nodes.len())
@@ -404,13 +504,11 @@ fn junction(world: &World, area: &Area, p: &Prefab) -> Vec<(u64, u64, Curve)> {
         .collect();
     pairs.sort_by(|a, b| turn(a.0, a.1).total_cmp(&turn(b.0, b.1)));
     let mut used = vec![false; nodes.len()];
+    let mut joined = Vec::new();
     let mut out = Vec::new();
-    let mut join = |i: usize, j: usize| {
+    let curve = |i: usize, j: usize| {
         let (a, b) = (&nodes[i], &nodes[j]);
-        if len2(sub(b.1, a.1)) > 120.0 {
-            return;
-        }
-        out.push((
+        (len2(sub(b.1, a.1)) <= 120.0).then_some((
             a.0,
             b.0,
             Curve {
@@ -419,13 +517,19 @@ fn junction(world: &World, area: &Area, p: &Prefab) -> Vec<(u64, u64, Curve)> {
                 p1: b.1,
                 d1: neg(b.2),
             },
-        ));
+        ))
+    };
+    let mut join = |i: usize, j: usize, visible: bool| {
+        joined.push((i.min(j), i.max(j)));
+        if let Some((a, b, c)) = curve(i, j) {
+            out.push((a, b, c, visible));
+        }
     };
     for &(i, j) in &pairs {
         if !used[i] && !used[j] && turn(i, j) < 50.0 {
             used[i] = true;
             used[j] = true;
-            join(i, j);
+            join(i, j, true);
         }
     }
     for i in 0..nodes.len() {
@@ -435,11 +539,63 @@ fn junction(world: &World, area: &Area, p: &Prefab) -> Vec<(u64, u64, Curve)> {
                 .min_by(|&a, &b| turn(i, a).total_cmp(&turn(i, b)));
             if let Some(j) = j {
                 used[i] = true;
-                join(i, j);
+                join(i, j, true);
             }
         }
     }
-    out
+    for &(i, j) in &pairs {
+        if !joined.contains(&(i, j))
+            && turn(i, j) < 135.0
+            && len2(sub(nodes[j].1, nodes[i].1)) > 2.0
+        {
+            if let Some((a, b, c)) = curve(i, j) {
+                out.push((a, b, c, false));
+            }
+        }
+    }
+    let mut turns = Vec::new();
+    if nodes.len() >= 4 {
+        let k = nodes.len() as f64;
+        let mid = [
+            nodes.iter().map(|n| n.1[0]).sum::<f64>() / k,
+            nodes.iter().map(|n| n.1[1]).sum::<f64>() / k,
+            nodes.iter().map(|n| n.1[2]).sum::<f64>() / k,
+        ];
+        let radius = nodes.iter().map(|n| len2(sub(n.1, mid))).sum::<f64>() / k;
+        let radius = (radius * 0.5).max(8.0);
+        for (i, (u, pos, d)) in nodes.iter().enumerate() {
+            let n = len2(*d).max(1e-9);
+            let d = [d[0] / n, d[1] / n, 0.0];
+            // beyond the middle, going round it anticlockwise
+            let far = [mid[0] + d[0] * radius, mid[1] + d[1] * radius, mid[2]];
+            let left = [-d[1], d[0], 0.0];
+            let id = p.uid.rotate_left(17) ^ (i as u64 + 1);
+            out.push((
+                *u,
+                id,
+                Curve {
+                    p0: *pos,
+                    d0: d,
+                    p1: far,
+                    d1: left,
+                },
+                false,
+            ));
+            out.push((
+                id,
+                *u,
+                Curve {
+                    p0: far,
+                    d0: left,
+                    p1: *pos,
+                    d1: neg(d),
+                },
+                false,
+            ));
+            turns.push(id);
+        }
+    }
+    (out, turns)
 }
 
 /// Ground a little below the nearest road, so roads are never buried.

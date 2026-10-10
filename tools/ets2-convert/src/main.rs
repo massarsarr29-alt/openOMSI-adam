@@ -39,6 +39,10 @@ enum Command {
         /// Map name shown in OMSI (defaults to the out folder name).
         #[arg(long)]
         name: Option<String>,
+        /// A bus line to add: a file with the line number, its minutes and its stops (see
+        /// `line::LineSpec::parse`).
+        #[arg(long)]
+        line: Option<PathBuf>,
     },
 }
 
@@ -57,6 +61,7 @@ fn main() -> Result<()> {
             tiles,
             spline,
             name,
+            line,
         } => {
             use ets2_convert::convert::{convert, Area, Options, World};
             let mut world = World::default();
@@ -86,18 +91,32 @@ fn main() -> Result<()> {
                 }
                 (None, None) => unreachable!("clap requires one"),
             };
-            let name = name.unwrap_or_else(|| {
-                out.file_name()
-                    .map_or("ets2".into(), |n| n.to_string_lossy().into_owned())
-            });
-            let map = convert(
+            let folder = out
+                .file_name()
+                .map_or("ets2".into(), |n| n.to_string_lossy().into_owned());
+            let name = name.unwrap_or_else(|| folder.clone());
+            let (mut map, net) = convert(
                 &world,
                 &Options {
                     name,
                     area,
                     road_spline: spline,
+                    // the helper spline lives in the map folder, under the OMSI root
+                    helper_spline: format!("maps\\{folder}\\ets2_helper.sli"),
                 },
             );
+            map.extra_files.push((
+                "ets2_helper.sli".into(),
+                ets2_convert::writer::HELPER_SPLINE.into(),
+            ));
+            if let Some(line) = line {
+                let text = std::fs::read_to_string(&line)
+                    .with_context(|| format!("reading {}", line.display()))?;
+                let spec = ets2_convert::line::LineSpec::parse(&text)?;
+                for l in ets2_convert::line::build(&mut map, &net, &area, &spec) {
+                    println!("{l}");
+                }
+            }
             let splines: usize = map.tiles.iter().map(|t| t.splines.len()).sum();
             map.write(&out)?;
             println!(
@@ -110,7 +129,8 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// The .base files of a map mod archive, or of a folder its "map" folder was copied to.
+/// The .base files of a map mod archive (or a zip of its map folder), or of a folder its
+/// "map" folder was copied to.
 fn sector_files(archive: &std::path::Path) -> Result<Vec<(String, Vec<u8>)>> {
     use std::io::Read;
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
@@ -130,7 +150,7 @@ fn sector_files(archive: &std::path::Path) -> Result<Vec<(String, Vec<u8>)>> {
         let mut zip = zip::ZipArchive::new(std::fs::File::open(archive)?)?;
         let names: Vec<String> = zip
             .file_names()
-            .filter(|n| n.starts_with("map/") && n.ends_with(".base"))
+            .filter(|n| n.ends_with(".base"))
             .map(String::from)
             .collect();
         for n in names {

@@ -56,6 +56,16 @@ pub struct Prefab {
     pub semaphores: Token,
 }
 
+/// A sign: its model, where it stands, and the texts written on it (stop names, line
+/// numbers, directions) when it is built from a template.
+#[derive(Debug, Clone)]
+pub struct Sign {
+    pub model: Token,
+    pub node: u64,
+    pub template: String,
+    pub texts: Vec<String>,
+}
+
 /// A rectangle marking part of the map as a city (centred on its node).
 #[derive(Debug, Clone)]
 pub struct City {
@@ -73,6 +83,7 @@ pub struct Sector {
     /// Bus stop prefab slaves: (item uid, node uid).
     pub bus_stops: Vec<(u64, u64)>,
     pub cities: Vec<City>,
+    pub signs: Vec<Sign>,
     pub nodes: BTreeMap<u64, Node>,
     /// How many items of each type the file has.
     pub item_counts: BTreeMap<u32, usize>,
@@ -145,16 +156,20 @@ fn action(r: &mut Reader, named: bool) -> Result<()> {
     Ok(())
 }
 
-fn sign(r: &mut Reader, version: u32) -> Result<()> {
-    r.token()?; // model
-    r.u64()?; // node
+fn sign(r: &mut Reader, version: u32) -> Result<Sign> {
+    let mut sign = Sign {
+        model: r.token()?,
+        node: r.u64()?,
+        template: String::new(),
+        texts: Vec::new(),
+    };
     r.token()?; // look
     r.token()?; // variant
     let boards = r.u8()?;
     r.skip(boards as usize * 3 * 8)?;
-    let template = r.string()?;
-    if template.is_empty() {
-        return Ok(());
+    sign.template = r.string()?;
+    if sign.template.is_empty() {
+        return Ok(sign);
     }
     if version >= 906 {
         let n = r.count(10)?;
@@ -180,15 +195,13 @@ fn sign(r: &mut Reader, version: u32) -> Result<()> {
             match ty {
                 1 => r.skip(1)?,
                 2..=4 => r.skip(4)?,
-                5 => {
-                    r.string()?;
-                }
+                5 => sign.texts.push(r.string()?),
                 6 => r.skip(8)?,
                 _ => bail!("sign attribute of unknown type {ty}"),
             }
         }
     }
-    Ok(())
+    Ok(sign)
 }
 
 /// Reads past the item of `ty` (its `kdop_item` already read), keeping roads, prefabs and
@@ -305,7 +318,7 @@ fn item(r: &mut Reader, s: &mut Sector, ty: u32, k: KdopItem) -> Result<()> {
             }
         }
         // Sign (with a traffic rule)
-        36 => sign(r, v)?,
+        36 => s.signs.push(sign(r, v)?),
         // Bus Stop: city, prefab (the economy link from 903 on), then the node
         37 => {
             r.token()?;

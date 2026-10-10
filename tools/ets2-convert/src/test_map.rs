@@ -44,6 +44,7 @@ pub fn build() -> Map {
             y: 0,
             splines: vec![straight, curve],
             terrain: Some(Terrain::flat()),
+            ..Default::default()
         }],
         entry_points: vec![EntryPoint {
             name: "Start".into(),
@@ -60,5 +61,6 @@ pub fn build() -> Map {
                 ("vehicles\\Citr_BX\\BX.ovh".into(), 40),
             ],
         }],
+        ..Default::default()
     }
 }

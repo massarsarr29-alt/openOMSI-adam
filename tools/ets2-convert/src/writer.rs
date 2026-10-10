@@ -1,5 +1,6 @@
-//! Writes an OMSI 2 map folder: `global.cfg`, `tile_x_y.map` with its `.terrain`, and
-//! `ailists.cfg`, in the layout `docs/FORMATS.md` describes and `omsi-map` reads back.
+//! Writes an OMSI 2 map folder: `global.cfg`, `tile_x_y.map` with its `.terrain`,
+//! `ailists.cfg` and the timetable in `TTData`, in the layout `docs/FORMATS.md` describes
+//! and `omsi-map` reads back.
 
 use anyhow::{Context, Result};
 use omsi_map::terrain::Terrain;
@@ -52,11 +53,24 @@ impl Spline {
     }
 }
 
+/// A scenery object of a tile, in the tile's frame; its height is above the ground.
+#[derive(Debug, Clone)]
+pub struct Object {
+    /// Relative to the OMSI root, e.g. `Sceneryobjects\Generic\bus_stop.sco`.
+    pub file: String,
+    pub id: i64,
+    pub pos: [f64; 3],
+    pub heading: f64,
+    /// What the editor's Labels dialog shows: a bus stop's name and timetable data.
+    pub labels: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Tile {
     pub x: i32,
     pub y: i32,
     pub splines: Vec<Spline>,
+    pub objects: Vec<Object>,
     pub terrain: Option<Terrain>,
 }
 
@@ -76,11 +90,87 @@ pub struct EntryPoint {
     pub heading: f64,
 }
 
+impl EntryPoint {
+    /// An entry point 2 m to the right of the start of a spline of tile `tile`, facing
+    /// along it.
+    pub fn beside(name: &str, tile: usize, s: &Spline) -> EntryPoint {
+        let h = s.heading.to_radians();
+        EntryPoint {
+            name: name.into(),
+            tile,
+            pos: [
+                s.pos[0] + 2.0 * h.cos(),
+                s.pos[1] - 2.0 * h.sin(),
+                s.pos[2] + 0.5,
+            ],
+            heading: s.heading,
+        }
+    }
+}
+
 /// A weighted list of AI vehicles (`[aigroup_2]`).
 #[derive(Debug, Clone)]
 pub struct AiGroup {
     pub name: String,
     pub vehicles: Vec<(String, u32)>,
+}
+
+/// A depot of timetable buses (`[aigroup_depot]`): the vehicle file and its fleet numbers
+/// with their number plates.
+#[derive(Debug, Clone)]
+pub struct Depot {
+    pub name: String,
+    /// The `.hof` (destination list) the buses use, by its name.
+    pub hof: String,
+    pub vehicle: String,
+    pub fleet: Vec<(String, String)>,
+}
+
+/// `TTData`: the stops, the ways between them and the lines that run on them.
+#[derive(Debug, Clone, Default)]
+pub struct Timetable {
+    pub stops: Vec<Stop>,
+    pub links: Vec<StnLink>,
+    pub trips: Vec<Trip>,
+    pub lines: Vec<Line>,
+}
+
+/// A stop of `Busstops.cfg`: its name and the bus stop object that stands for it.
+#[derive(Debug, Clone)]
+pub struct Stop {
+    pub name: String,
+    pub tile: usize,
+    pub object_id: i64,
+}
+
+/// The way from one stop object to the next, as the lanes (spline, path, tile index, length)
+/// a bus drives along.
+#[derive(Debug, Clone)]
+pub struct StnLink {
+    pub from: i64,
+    pub to: i64,
+    pub steps: Vec<(i64, u32, usize, f64)>,
+}
+
+/// A trip (`.ttp`): the stop objects it calls at and how long it takes.
+#[derive(Debug, Clone)]
+pub struct Trip {
+    pub name: String,
+    pub terminus: String,
+    pub line: String,
+    pub stops: Vec<i64>,
+    pub minutes: f64,
+}
+
+/// A tour of a line: its number, the depot its bus comes from, and the trips it drives with
+/// their departures (minutes after midnight).
+pub type Tour = (String, String, Vec<(String, f64)>);
+
+/// A line (`.ttl`): its tours.
+#[derive(Debug, Clone)]
+pub struct Line {
+    pub name: String,
+    pub tours: Vec<Tour>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -93,7 +183,17 @@ pub struct Map {
     pub tiles: Vec<Tile>,
     pub entry_points: Vec<EntryPoint>,
     pub ai_groups: Vec<AiGroup>,
+    pub depots: Vec<Depot>,
+    pub timetable: Timetable,
+    /// Files written into the map folder as they are (a helper spline).
+    pub extra_files: Vec<(String, String)>,
 }
+
+/// An invisible spline with one lane each way, 3.3 m to either side of the middle as on
+/// Marcel's Seeburger street: for turns through junctions that are not drawn yet. Path 0
+/// runs backwards, path 1 forwards.
+pub const HELPER_SPLINE: &str =
+    "[path]\n0\n-1.639\n0.100\n3.278\n1\n\n[path]\n0\n1.639\n0.100\n3.278\n0\n";
 
 /// Map files are UTF-16 LE with a byte order mark and CR LF, like the OMSI editor writes them.
 fn utf16(text: &str) -> Vec<u8> {
@@ -108,12 +208,16 @@ fn utf16(text: &str) -> Vec<u8> {
     out
 }
 
-/// Other text files are Windows-1252 with CR LF.
+/// Other text files are Windows-1252 with CR LF (accented letters are where Latin-1 has
+/// them).
 fn ansi(text: &str) -> Vec<u8> {
     text.replace("\r\n", "\n")
         .replace('\n', "\r\n")
         .chars()
-        .map(|c| if (c as u32) < 0x80 { c as u8 } else { b'?' })
+        .map(|c| match c as u32 {
+            u @ (0..=0x7F | 0xA0..=0xFF) => u as u8,
+            _ => b'?',
+        })
         .collect()
 }
 
@@ -121,7 +225,12 @@ impl Map {
     fn next_id(&self) -> i64 {
         self.tiles
             .iter()
-            .flat_map(|t| t.splines.iter().map(|s| s.id))
+            .flat_map(|t| {
+                t.splines
+                    .iter()
+                    .map(|s| s.id)
+                    .chain(t.objects.iter().map(|o| o.id))
+            })
             .max()
             .unwrap_or(0)
             + 1
@@ -136,6 +245,10 @@ impl Map {
         let _ = writeln!(s, "[version]\n14\n");
         let _ = writeln!(s, "[NextIDCode]\n{}\n", self.next_id());
         let _ = writeln!(s, "[moneysystem]\nMoney\\DM\\DM.cfg\n");
+        let _ = writeln!(s, "[ticketpack]\nTicketPacks\\Berlin_1\\Berlin_1.otp\n");
+        if let Some(d) = self.depots.first() {
+            let _ = writeln!(s, "[standarddepot]\n{}\n", d.name);
+        }
         let _ = writeln!(s, "[years]\n2000\n2030\n");
         let _ = writeln!(
             s,
@@ -195,6 +308,23 @@ impl Map {
                 sp.tex_offset
             );
         }
+        for o in &tile.objects {
+            let _ = writeln!(
+                s,
+                "[object]\n0\n{}\n{}\n{}\n{}\n{}\n{}\n0\n0\n{}",
+                o.file,
+                o.id,
+                o.pos[0],
+                o.pos[1],
+                o.pos[2],
+                o.heading,
+                o.labels.len()
+            );
+            for l in &o.labels {
+                let _ = writeln!(s, "{l}");
+            }
+            s.push('\n');
+        }
         s
     }
 
@@ -206,6 +336,69 @@ impl Map {
                 let _ = writeln!(s, "{file}\t{weight}");
             }
             let _ = writeln!(s, "[end]\n");
+        }
+        for d in &self.depots {
+            let _ = writeln!(s, "[aigroup_depot]\n{}\n{}\n", d.name, d.hof);
+            let _ = writeln!(s, "[aigroup_depot_typgroup_2]\n{}", d.vehicle);
+            for (number, plate) in &d.fleet {
+                let _ = writeln!(s, "{number}\t{plate}");
+            }
+            let _ = writeln!(s, "[end]\n");
+        }
+        s
+    }
+
+    pub fn busstops_cfg(&self) -> String {
+        let mut s = String::from("File created with ets2-convert\n\n");
+        for b in &self.timetable.stops {
+            let _ = writeln!(
+                s,
+                "[busstop]\n{}\n{}\n{}\n0\n0\n0\n",
+                b.name, b.tile, b.object_id
+            );
+        }
+        s
+    }
+
+    pub fn stnlinks_cfg(&self) -> String {
+        let mut s = String::from("File created with ets2-convert\n\n");
+        for l in &self.timetable.links {
+            let length: f64 = l.steps.iter().map(|e| e.3).sum();
+            // (the six numbers after the stops are not used by Open OMSI; these are a stock
+            // link's)
+            let _ = writeln!(
+                s,
+                "[StnLink]\n{length:.3}\n{}\n{}\n2.42\n1.65\n10.3\n6.74\n0\n1\n",
+                l.from, l.to
+            );
+            for (i, (id, path, tile, len)) in l.steps.iter().enumerate() {
+                let _ = writeln!(
+                    s,
+                    "   {i}:\n[StnLink_entry]\n{id}\n{path}\n{tile}\n{len:.3}\n-1\n0\n0\n"
+                );
+            }
+        }
+        s
+    }
+
+    pub fn trip_ttp(t: &Trip) -> String {
+        let mut s = String::from("File created with ets2-convert\n\n");
+        let _ = writeln!(s, "[trip]\n\n{}\n{}\n", t.terminus, t.line);
+        for id in &t.stops {
+            let _ = writeln!(s, "[station_typ2]\n{id}\n");
+        }
+        let _ = writeln!(s, "[profile]\nstandard\n{:.3}\n", t.minutes);
+        s
+    }
+
+    pub fn line_ttl(l: &Line) -> String {
+        let mut s =
+            String::from("File created with ets2-convert\n\n[userallowed]\n\n[priority]\n1\n\n");
+        for (number, group, trips) in &l.tours {
+            let _ = writeln!(s, "[newtour]\n{number}\n{group}\n0\n");
+            for (trip, dep) in trips {
+                let _ = writeln!(s, "[addtrip]\n{trip}\n0\n{dep:.3}\n");
+            }
         }
         s
     }
@@ -226,6 +419,26 @@ impl Map {
             }
         }
         put("ailists.cfg", ansi(&self.ailists_cfg()))?;
+        for (name, text) in &self.extra_files {
+            put(name, ansi(text))?;
+        }
+        let tt = &self.timetable;
+        if !tt.stops.is_empty() {
+            let dir = dir.join("TTData");
+            fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+            let put = |name: &str, text: String| -> Result<()> {
+                let p = dir.join(name);
+                fs::write(&p, ansi(&text)).with_context(|| format!("writing {}", p.display()))
+            };
+            put("Busstops.cfg", self.busstops_cfg())?;
+            put("StnLinks.cfg", self.stnlinks_cfg())?;
+            for t in &tt.trips {
+                put(&format!("{}.ttp", t.name), Self::trip_ttp(t))?;
+            }
+            for l in &tt.lines {
+                put(&format!("{}.ttl", l.name), Self::line_ttl(l))?;
+            }
+        }
         Ok(())
     }
 }
