@@ -1,0 +1,14 @@
+[package]
+name = "ets2-convert"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Writes OMSI 2 maps (global.cfg, tiles, terrain, AI lists); first step of a converter for Euro Truck Simulator 2 maps"
+
+[dependencies]
+omsi-map = { path = "../../crates/omsi-map" }
+anyhow.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+omsi-cfg = { path = "../../crates/omsi-cfg" }

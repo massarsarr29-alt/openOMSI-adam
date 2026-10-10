@@ -22,6 +22,7 @@ members = [
     "crates/omsi-launcher-core",
     "crates/omsi-app",
     "tools/omsi-check",
+    "tools/ets2-convert",
 ]
 exclude = ["launcher/src-tauri"]
 

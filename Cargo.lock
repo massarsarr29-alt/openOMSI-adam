@@ -1582,6 +1582,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ets2-convert"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "omsi-cfg",
+ "omsi-map",
+]
+
+[[package]]
 name = "euclid"
 version = "0.22.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
