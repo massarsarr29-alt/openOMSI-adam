@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -17,6 +17,26 @@ enum Command {
     /// Reads every sector of a map mod (.scs/.zip, or a folder with its map folder) and says
     /// what it holds.
     Inspect { archive: PathBuf },
+    /// Converts the roads around an ETS 2 city into an OMSI map folder.
+    Convert {
+        archive: PathBuf,
+        out: PathBuf,
+        /// City name as the map defines it, e.g. "vincennes".
+        #[arg(long)]
+        city: String,
+        /// Width of the converted square, in 300 m tiles.
+        #[arg(long, default_value_t = 5)]
+        tiles: u32,
+        /// The OMSI spline every road is drawn with.
+        #[arg(
+            long,
+            default_value = "Splines\\Marcel\\str_2spur_11m_SeeburgerStr1.sli"
+        )]
+        spline: String,
+        /// Map name shown in OMSI (defaults to the out folder name).
+        #[arg(long)]
+        name: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -26,15 +46,51 @@ fn main() -> Result<()> {
             println!("test map written to {}", out.display());
         }
         Command::Inspect { archive } => inspect(&archive)?,
+        Command::Convert {
+            archive,
+            out,
+            city,
+            tiles,
+            spline,
+            name,
+        } => {
+            use ets2_convert::convert::{convert, Area, Options, World};
+            let mut world = World::default();
+            for (n, data) in sector_files(&archive)? {
+                let s = ets2_convert::scs::sector::Sector::parse_base(&data)
+                    .with_context(|| format!("reading {n}"))?;
+                world.add(s);
+            }
+            let centre = world
+                .city_centre(&city)
+                .with_context(|| format!("no city called {city} in the map"))?;
+            let name = name.unwrap_or_else(|| {
+                out.file_name()
+                    .map_or("ets2".into(), |n| n.to_string_lossy().into_owned())
+            });
+            let map = convert(
+                &world,
+                &Options {
+                    name,
+                    area: Area::around(centre, tiles),
+                    road_spline: spline,
+                },
+            );
+            let splines: usize = map.tiles.iter().map(|t| t.splines.len()).sum();
+            map.write(&out)?;
+            println!(
+                "{} tiles, {splines} splines written to {}",
+                map.tiles.len(),
+                out.display()
+            );
+        }
     }
     Ok(())
 }
 
-fn inspect(archive: &std::path::Path) -> Result<()> {
-    use ets2_convert::scs::sector::Sector;
-    use std::collections::BTreeMap;
+/// The .base files of a map mod archive, or of a folder its "map" folder was copied to.
+fn sector_files(archive: &std::path::Path) -> Result<Vec<(String, Vec<u8>)>> {
     use std::io::Read;
-    // a mod archive, or a folder its "map" folder was copied out to
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     if archive.is_dir() {
         let mut stack = vec![archive.to_path_buf()];
@@ -62,6 +118,13 @@ fn inspect(archive: &std::path::Path) -> Result<()> {
         }
     }
     files.sort();
+    Ok(files)
+}
+
+fn inspect(archive: &std::path::Path) -> Result<()> {
+    use ets2_convert::scs::sector::Sector;
+    use std::collections::BTreeMap;
+    let files = sector_files(archive)?;
     let (mut ok, mut failed) = (0, 0);
     let mut types: BTreeMap<u32, usize> = BTreeMap::new();
     let (mut roads, mut prefabs, mut nodes, mut stops) = (0, 0, 0, 0);

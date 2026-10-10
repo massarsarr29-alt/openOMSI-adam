@@ -56,6 +56,15 @@ pub struct Prefab {
     pub semaphores: Token,
 }
 
+/// A rectangle marking part of the map as a city (centred on its node).
+#[derive(Debug, Clone)]
+pub struct City {
+    pub name: Token,
+    pub width: f32,
+    pub height: f32,
+    pub node: u64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Sector {
     pub version: u32,
@@ -63,6 +72,7 @@ pub struct Sector {
     pub prefabs: Vec<Prefab>,
     /// Bus stop prefab slaves: (item uid, node uid).
     pub bus_stops: Vec<(u64, u64)>,
+    pub cities: Vec<City>,
     pub nodes: BTreeMap<u64, Node>,
     /// How many items of each type the file has.
     pub item_counts: BTreeMap<u32, usize>,
@@ -267,7 +277,12 @@ fn item(r: &mut Reader, s: &mut Sector, ty: u32, k: KdopItem) -> Result<()> {
             r.u64s()?;
         }
         // City: name, width, height, node
-        12 => r.skip(8 + 4 + 4 + 8)?,
+        12 => s.cities.push(City {
+            name: r.token()?,
+            width: r.f32()?,
+            height: r.f32()?,
+            node: r.u64()?,
+        }),
         // Map Overlay: look, node
         18 => r.skip(8 + 8)?,
         // Ferry: name, prefab, node, unload offset
