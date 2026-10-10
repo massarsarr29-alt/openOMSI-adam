@@ -175,6 +175,15 @@ impl<'a> Objects<'a> {
                 }
             };
             let tex = mat.texture.clone().and_then(|t| self.texture(&t));
+            let mut mat = mat;
+            // OMSI has no second texture to multiply by: its mean colour tints the material
+            // (ETS doubles the product, so a mid-grey multiply texture leaves the base as it is)
+            if let Some(tint) = mat.mult.clone().and_then(|t| self.mean_colour(&t)) {
+                mat.diffuse = std::array::from_fn(|k| (mat.diffuse[k] * tint[k] * 2.0).min(1.0));
+                mat.mult = Some(String::new()); // from here on it only marks a tinted material
+            } else {
+                mat.mult = None;
+            }
             materials.push((mat, tex));
         }
 
@@ -259,12 +268,27 @@ impl<'a> Objects<'a> {
                     Some(Alpha::Blend) => sco.push_str("[matl_alpha]\n2\n"),
                     None => {}
                 }
+                // a tinted facade: its colour under the sky's light too (the o3d's is white)
+                if mat.mult.is_some() {
+                    let [r, g, b] = mat.diffuse;
+                    let _ = writeln!(sco, "[matl_allcolor]\n{r}\n{g}\n{b}\n1\n{r}\n{g}\n{b}\n0\n0\n0\n0\n0\n0\n0");
+                }
                 sco.push('\n');
             }
         }
         self.files.insert(format!("model\\{name}.o3d"), o3d(&vertices, &triangles, &o3d_mats));
         self.files.insert(format!("{name}.sco"), sco.into_bytes());
         Ok(Some(format!("Sceneryobjects\\{}\\{name}.sco", self.folder)))
+    }
+
+    /// The mean colour of a texture (by its `.tobj`): its smallest mipmap, 0..1.
+    fn mean_colour(&mut self, tobj: &str) -> Option<[f32; 3]> {
+        let dds = self.vfs.read(tobj).ok().flatten().and_then(|d| tobj_texture(&d)).unwrap_or_else(|| tobj.replace(".tobj", ".dds"));
+        let c = self.vfs.read(&dds).ok().flatten().and_then(|d| smallest_mip_colour(&d));
+        if c.is_none() {
+            *self.problems.entry("multiply texture unread (facade left untinted)".into()).or_default() += 1;
+        }
+        c
     }
 
     /// Copies a texture (by its `.tobj`) into `texture\`, once; None when it cannot be used.
@@ -526,6 +550,35 @@ fn facing_its_normals(v: &[[f32; 8]], t: [u32; 3]) -> [u32; 3] {
     } else {
         t
     }
+}
+
+/// The colour of the last (1×1 to 4×4) mipmap of a BC1/BC2/BC3 `.dds`: the mean of its
+/// block's two end colours.
+fn smallest_mip_colour(d: &[u8]) -> Option<[f32; 3]> {
+    if !usable_dds(d) {
+        return None;
+    }
+    let u = |at: usize| u32::from_le_bytes(d[at..at + 4].try_into().unwrap());
+    let (h, w, mips) = (u(12) as usize, u(16) as usize, u(28).max(1) as usize);
+    let four = &d[84..88];
+    let (data, bc1) = if four == b"DX10" {
+        (148, matches!(u(128), 70..=72))
+    } else {
+        (128, four == b"DXT1")
+    };
+    let block = if bc1 { 8 } else { 16 };
+    let mut at = data;
+    let (mut w, mut h) = (w, h);
+    for _ in 1..mips {
+        at += w.div_ceil(4).max(1) * h.div_ceil(4).max(1) * block;
+        w = (w / 2).max(1);
+        h = (h / 2).max(1);
+    }
+    let colour = at + if bc1 { 0 } else { 8 };
+    let b = d.get(colour..colour + 4)?;
+    let rgb = |c: u16| [((c >> 11) & 31) as f32 / 31.0, ((c >> 5) & 63) as f32 / 63.0, (c & 31) as f32 / 31.0];
+    let (c0, c1) = (rgb(u16::from_le_bytes([b[0], b[1]])), rgb(u16::from_le_bytes([b[2], b[3]])));
+    Some(std::array::from_fn(|k| (c0[k] + c1[k]) / 2.0))
 }
 
 /// The block formats Open OMSI reads: DXT1/3/5, or their DXGI numbers.

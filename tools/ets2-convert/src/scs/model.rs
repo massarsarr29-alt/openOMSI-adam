@@ -228,6 +228,8 @@ pub struct Material {
     pub effect: String,
     /// The `.tobj` of the base texture, when there is one.
     pub texture: Option<String>,
+    /// The `.tobj` the base texture is multiplied by (`.mult.` effects), when there is one.
+    pub mult: Option<String>,
     pub diffuse: [f32; 3],
 }
 
@@ -257,7 +259,15 @@ impl Material {
                 }
             }
         }
-        Material { effect, texture, diffuse }
+        let mult = text.find("\"texture_mult\"").and_then(|i| {
+            let rest = &text[i..];
+            let a = rest.find("source")?;
+            let rest = &rest[a..];
+            let q = rest.find('"')? + 1;
+            let e = rest[q..].find('"')? + q;
+            Some(rest[q..e].to_string())
+        });
+        Material { effect, texture, mult, diffuse }
     }
 
     /// Effects that draw nothing seen in daylight, or that OMSI cannot draw the way the game
@@ -313,6 +323,12 @@ mod tests {
         assert_eq!(m.texture.as_deref(), Some("/model/a/b.tobj"));
         assert_eq!(m.diffuse, [0.5, 1.0, 1.0]);
         assert_eq!(m.alpha(), Some(Alpha::Test));
+        assert_eq!(m.mult, None);
+        let gs = Material::parse(
+            "effect : \"eut2.dif.spec.mult.dif.spec.iamod.dif.spec.rfx\" {\n\ttexture : \"texture_base\" {\n\t\tsource : \"/material/tiled/plaster_gs_01.tobj\"\n\t}\n\ttexture : \"texture_mult\" {\n\t\tsource : \"/material/tiled/plaster_over_01.tobj\"\n\t}\n}",
+        );
+        assert_eq!(gs.texture.as_deref(), Some("/material/tiled/plaster_gs_01.tobj"));
+        assert_eq!(gs.mult.as_deref(), Some("/material/tiled/plaster_over_01.tobj"));
         let old = Material::parse("material : \"eut2.dif\" {\n\ttexture[0] : \"/x/y.tobj\"\n}");
         assert_eq!(old.texture.as_deref(), Some("/x/y.tobj"));
     }
