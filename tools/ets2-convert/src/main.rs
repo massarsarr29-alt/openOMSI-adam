@@ -150,6 +150,10 @@ fn main() -> Result<()> {
                 for l in ets2_convert::objects::place(&mut map, &area, &world, &defs, &mut made) {
                     println!("{l}");
                 }
+                let prefabs = ets2_convert::objects::prefab_defs(&vfs)?;
+                for l in ets2_convert::objects::place_prefabs(&mut map, &area, &world, &prefabs, &mut made) {
+                    println!("{l}");
+                }
                 let root = match omsi {
                     Some(r) => r,
                     None => out

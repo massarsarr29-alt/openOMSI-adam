@@ -8,7 +8,8 @@
 
 use crate::scs::model::{tobj_texture, Alpha, Desc, Geometry, Material};
 use crate::scs::token::Token;
-use crate::convert::{Area, World};
+use crate::convert::{direction, Area, World};
+use crate::scs::sector::Node;
 use crate::line::tile_at;
 use crate::scs::vfs::Vfs;
 use crate::writer::{Map, Object};
@@ -32,6 +33,40 @@ pub fn model_defs(vfs: &Vfs) -> Result<HashMap<Token, String>> {
         }
     }
     Ok(out)
+}
+
+/// The prefabs the map's `def` files name: token → (`.ppd`, `.pmd`).
+pub fn prefab_defs(vfs: &Vfs) -> Result<HashMap<Token, (String, String)>> {
+    let mut out = HashMap::new();
+    for name in vfs.list("/def/world")? {
+        if !(name.starts_with("prefab") && name.ends_with(".sii")) {
+            continue;
+        }
+        let Some(d) = vfs.read(&format!("/def/world/{name}"))? else { continue };
+        let text = String::from_utf8_lossy(&d);
+        for (token, body) in units(&text, "prefab_model", "prefab.") {
+            if let (Some(ppd), Some(pmd)) = (quoted_value(body, "prefab_desc"), quoted_value(body, "model_desc")) {
+                out.entry(token).or_insert((ppd, pmd));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The nodes of a `.ppd` (version 25): position and direction in the prefab's frame.
+pub fn ppd_nodes(d: &[u8]) -> Result<Vec<([f64; 3], [f64; 3])>> {
+    let u = |at: usize| -> Result<u32> { Ok(u32::from_le_bytes(d.get(at..at + 4).context("ppd too short")?.try_into().unwrap())) };
+    let f = |at: usize| -> Result<f64> { Ok(f32::from_bits(u(at)?) as f64) };
+    let version = u(0)?;
+    anyhow::ensure!(version == 25, "ppd version {version} (this reader knows 25)");
+    let (n, at) = (u(4)? as usize, u(48)? as usize);
+    (0..n)
+        .map(|i| {
+            // terrain points and variants (16 bytes), position, direction, lanes in and out
+            let b = at + i * 104 + 16;
+            Ok(([f(b)?, f(b + 4)?, f(b + 8)?], [f(b + 12)?, f(b + 16)?, f(b + 20)?]))
+        })
+        .collect()
 }
 
 /// The `kind : prefix.name { body }` units of a SII text.
@@ -72,7 +107,7 @@ fn quoted_value(body: &str, key: &str) -> Option<String> {
 
 /// The scenery objects written so far, under `Sceneryobjects\<folder>`.
 pub struct Objects<'a> {
-    vfs: &'a Vfs,
+    pub vfs: &'a Vfs,
     /// Folder under `Sceneryobjects`, e.g. `ets2-idf`.
     pub folder: String,
     /// (pmd, look, variant) → the `.sco` path relative to the OMSI folder, or None when the
@@ -295,6 +330,106 @@ pub fn place(map: &mut Map, area: &Area, world: &World, defs: &HashMap<Token, St
     report
 }
 
+/// Places the visible models of the prefabs in the area (petrol stations, depots, plazas;
+/// junction prefabs of the map mod draw nothing and are left out when their model is
+/// made). A prefab stands where its `.ppd` nodes meet the map nodes it was laid on: map
+/// node `i` is the `.ppd`'s node `origin + i`. It is turned about the vertical only, by
+/// the angle between two of its nodes (or, with one node, its direction).
+pub fn place_prefabs(
+    map: &mut Map,
+    area: &Area,
+    world: &World,
+    defs: &HashMap<Token, (String, String)>,
+    objects: &mut Objects,
+) -> Vec<String> {
+    let mut next_id = map.next_id();
+    let (mut placed, mut empty, mut unknown, mut unread, mut misfit) = (0usize, 0usize, 0usize, 0usize, 0usize);
+    for p in &world.prefabs {
+        let map_nodes: Vec<&Node> = p.nodes.iter().filter_map(|u| world.nodes.get(u)).collect();
+        if map_nodes.len() != p.nodes.len() || map_nodes.is_empty() || !area.contains(&map_nodes[0].pos) {
+            continue;
+        }
+        let Some((ppd, pmd)) = defs.get(&p.model) else {
+            unknown += 1;
+            continue;
+        };
+        let local = match objects.vfs.read(ppd).ok().flatten().map(|d| ppd_nodes(&d)) {
+            Some(Ok(n)) if n.len() == map_nodes.len() => n,
+            _ => {
+                unread += 1;
+                continue;
+            }
+        };
+        let k = local.len();
+        let at = |i: usize| &local[(p.origin as usize + i) % k];
+        // the pair of nodes farthest apart, or the first node's direction
+        let far = (1..k).max_by(|&a, &b| {
+            let d = |i: usize| (at(i).0[0] - at(0).0[0]).hypot(at(i).0[2] - at(0).0[2]);
+            d(a).total_cmp(&d(b))
+        });
+        let (v, w) = match far {
+            Some(j) => (
+                sub3(at(j).0, at(0).0),
+                sub3(map_nodes[j].pos, map_nodes[0].pos),
+            ),
+            None => {
+                let d = direction(map_nodes[0]);
+                (at(0).1, [d[0], d[2], -d[1]])
+            }
+        };
+        let theta = yaw_between(v, w);
+        let (s, c) = theta.sin_cos();
+        let a = at(0).0;
+        let turned = [a[0] * c + a[2] * s, a[1], -a[0] * s + a[2] * c];
+        let origin = sub3(map_nodes[0].pos, turned);
+        // how far the other nodes land from their map nodes (a wrong node order shows here)
+        let miss = (1..k)
+            .map(|i| {
+                let b = at(i).0;
+                let x = [origin[0] + b[0] * c + b[2] * s, origin[2] - b[0] * s + b[2] * c];
+                (x[0] - map_nodes[i].pos[0]).hypot(x[1] - map_nodes[i].pos[2])
+            })
+            .fold(0.0, f64::max);
+        if miss > 1.0 {
+            misfit += 1;
+        }
+        let Some(file) = objects.object(pmd, Token::default(), p.variant, [1.0; 3]) else {
+            empty += 1;
+            continue;
+        };
+        let o = area.to_omsi(origin);
+        let (tile, l) = tile_at(map, [o[0], o[1]]);
+        let ground = map.tiles[tile].terrain.as_ref().map_or(0.0, |t| t.sample(l[0] as f32, l[1] as f32) as f64);
+        let half = theta / 2.0;
+        let [heading, pitch, bank] = angles([half.cos() as f32, 0.0, half.sin() as f32, 0.0]);
+        map.tiles[tile].objects.push(Object {
+            file,
+            id: next_id,
+            pos: [l[0], l[1], o[2] - ground],
+            heading,
+            tilt: [pitch, bank],
+            labels: Vec::new(),
+        });
+        next_id += 1;
+        placed += 1;
+    }
+    vec![format!(
+        "prefabs: {placed} placed ({misfit} whose nodes fit their map nodes worse than 1 m), {empty} that draw nothing or could not be made, {unknown} without a definition, {unread} whose .ppd is missing or unread"
+    )]
+}
+
+fn sub3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+/// The turn about the game's up axis (y) that takes the horizontal part of `v` to `w`'s:
+/// `R(θ)·(x, z) = (x cos θ + z sin θ, -x sin θ + z cos θ)`.
+fn yaw_between(v: [f64; 3], w: [f64; 3]) -> f64 {
+    let s = v[2] * w[0] - v[0] * w[2];
+    let c = v[0] * w[0] + v[2] * w[2];
+    s.atan2(c)
+}
+
 /// A node's rotation as an OMSI map file's heading, pitch and bank (degrees). The node's
 /// quaternion (w, x, y, z) turns the game's frame; in the map's (x east, y north, z up)
 /// that is `R = C·Q·Cᵀ` with `C: (x, y, z) → (x, -z, y)`, and Open OMSI builds
@@ -441,6 +576,16 @@ mod tests {
         let v = [v[0] * ry.cos() + v[2] * ry.sin(), v[1], -v[0] * ry.sin() + v[2] * ry.cos()];
         let v = [v[0] * rz.cos() - v[1] * rz.sin(), v[0] * rz.sin() + v[1] * rz.cos(), v[2]];
         assert!((0..3).all(|k| (v[k] - d[k]).abs() < 1e-5), "{v:?} {d:?}");
+    }
+
+    #[test]
+    fn yaw_turns_one_vector_onto_another() {
+        for t in [0.3f64, 2.0, -1.2] {
+            let v = [3.0, 0.0, 1.0];
+            let (s, c) = t.sin_cos();
+            let w = [v[0] * c + v[2] * s, 5.0, -v[0] * s + v[2] * c];
+            assert!((yaw_between(v, w) - t).abs() < 1e-9);
+        }
     }
 
     #[test]
