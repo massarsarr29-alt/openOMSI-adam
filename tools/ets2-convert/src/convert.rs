@@ -421,7 +421,7 @@ pub fn convert(world: &World, opt: &Options) -> (Map, Network) {
         .links
         .iter()
         .filter(|l| l.visible)
-        .flat_map(|l| l.pieces.iter().map(|(_, s)| s.pos))
+        .flat_map(|l| l.pieces.iter().flat_map(|(_, s)| along(s)))
         .collect();
     for l in network.links.iter().filter(|l| l.visible) {
         for (t, s) in &l.pieces {
@@ -431,8 +431,9 @@ pub fn convert(world: &World, opt: &Options) -> (Map, Network) {
             tiles[*t].splines.push(s);
         }
     }
+    let grid = Grid::new(&samples);
     for t in &mut tiles {
-        t.terrain = Some(terrain(t, &samples));
+        t.terrain = Some(terrain(t, &grid));
     }
 
     // the bus starts on the road nearest the middle of the area, on its right-hand side
@@ -598,39 +599,120 @@ fn junction(world: &World, area: &Area, p: &Prefab) -> (Vec<Way>, Vec<u64>) {
     (out, turns)
 }
 
-/// Ground a little below the nearest road, so roads are never buried.
-fn terrain(tile: &Tile, samples: &[[f64; 3]]) -> Terrain {
+/// Points every 10 m or so along a spline, with the road's height there.
+fn along(s: &Spline) -> Vec<[f64; 3]> {
+    let steps = (s.length / 10.0).ceil().max(1.0) as usize;
+    (0..=steps)
+        .map(|k| {
+            let d = s.length * k as f64 / steps as f64;
+            let mut part = s.clone();
+            part.length = d;
+            let ([x, y], _) = part.end();
+            let rise = s.grad_start * d + (s.grad_end - s.grad_start) * d * d / (2.0 * s.length.max(1e-6));
+            [x, y, s.pos[2] + rise / 100.0]
+        })
+        .collect()
+}
+
+/// Road points sorted into 50 m squares, to find the ones near a place quickly.
+struct Grid {
+    cells: HashMap<(i64, i64), Vec<[f64; 3]>>,
+    /// Each square's average road point and its number of points, for the smooth surface.
+    coarse: Vec<([f64; 3], f64)>,
+}
+
+impl Grid {
+    const CELL: f64 = 50.0;
+
+    fn new(samples: &[[f64; 3]]) -> Grid {
+        let mut cells: HashMap<_, Vec<_>> = HashMap::new();
+        for p in samples {
+            let key = ((p[0] / Self::CELL).floor() as i64, (p[1] / Self::CELL).floor() as i64);
+            cells.entry(key).or_default().push(*p);
+        }
+        let coarse = cells
+            .values()
+            .map(|ps| {
+                let k = ps.len() as f64;
+                let sum = ps.iter().fold([0.0; 3], |a, p| [a[0] + p[0], a[1] + p[1], a[2] + p[2]]);
+                ([sum[0] / k, sum[1] / k, sum[2] / k], k)
+            })
+            .collect();
+        Grid { cells, coarse }
+    }
+
+    /// Every road point within `r` metres of (x, y), with its distance.
+    /// A smooth height at (x, y): every square's average, weighted by its distance.
+    /// No square is ever left out, so the surface has no steps anywhere.
+    fn smooth(&self, x: f64, y: f64) -> f64 {
+        let (mut sum, mut weight) = (0.0, 0.0);
+        for (p, k) in &self.coarse {
+            let d2 = (p[0] - x).powi(2) + (p[1] - y).powi(2);
+            let w = k / (d2 + 400.0);
+            sum += w * p[2];
+            weight += w;
+        }
+        if weight > 0.0 { sum / weight } else { 0.0 }
+    }
+
+    fn around(&self, x: f64, y: f64, r: f64, mut f: impl FnMut(&[f64; 3], f64)) {
+        let (cx, cy) = ((x / Self::CELL).floor() as i64, (y / Self::CELL).floor() as i64);
+        let k = (r / Self::CELL).ceil() as i64;
+        for gx in cx - k..=cx + k {
+            for gy in cy - k..=cy + k {
+                for p in self.cells.get(&(gx, gy)).into_iter().flatten() {
+                    let d = (p[0] - x).hypot(p[1] - y);
+                    if d < r {
+                        f(p, d);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Ground under the roads, and a smooth surface between them.
+///
+/// Right beside a road the ground sits a little below it, so roads are never buried.
+/// Further away the height is an average of the roads around, weighted by distance,
+/// so neighbouring roads at different heights meet in a slope instead of a cliff.
+/// The same rule is used everywhere, so tiles meet without a step.
+fn terrain(tile: &Tile, grid: &Grid) -> Terrain {
+    const ROAD: f64 = 9.0; // half the width of ground kept under a road
+    const SLOPE: f64 = 40.0; // the ground meets the smooth surface this far from a road
+    const REACH: f64 = 200.0; // how far a road keeps the ground from rising steeply
     let mut t = Terrain::flat();
     let (ox, oy) = (tile.x as f64 * TILE, tile.y as f64 * TILE);
-    let near: Vec<_> = samples
-        .iter()
-        .filter(|p| {
-            (ox - 150.0..ox + TILE + 150.0).contains(&p[0])
-                && (oy - 150.0..oy + TILE + 150.0).contains(&p[1])
-        })
-        .collect();
-    let fallback = samples.iter().map(|p| p[2]).fold(f64::MAX, f64::min);
-    let fallback = if fallback == f64::MAX { 0.0 } else { fallback };
     let n = t.samples();
     for iy in 0..n {
         for ix in 0..n {
             let x = ox + ix as f64 * TILE / t.cells as f64;
             let y = oy + iy as f64 * TILE / t.cells as f64;
-            let d = |p: &[f64; 3]| (p[0] - x).hypot(p[1] - y);
-            let close = near
-                .iter()
-                .filter(|p| d(p) < 15.0)
-                .map(|p| p[2])
-                .fold(f64::MAX, f64::min);
-            let h = if close < f64::MAX {
-                close
+            // the highest the ground may be: below every road close by, rising gently away from it
+            let mut cap = f64::MAX;
+            // the nearest road, and the lowest road right here
+            let (mut closest, mut nearest) = (f64::MAX, 0.0);
+            let mut under = f64::MAX;
+            grid.around(x, y, REACH, |p, d| {
+                cap = cap.min(p[2] - 0.3 + 0.5 * (d - ROAD).max(0.0));
+                if d < ROAD {
+                    under = under.min(p[2] - 0.3);
+                }
+                if d < closest {
+                    (closest, nearest) = (d, p[2] - 0.3);
+                }
+            });
+            let smooth = grid.smooth(x, y);
+            let h = if under < f64::MAX {
+                under
+            } else if closest < SLOPE {
+                // from the road's edge the ground eases into the smooth surface
+                let k = (closest - ROAD) / (SLOPE - ROAD);
+                (nearest + (smooth - nearest) * k * k * (3.0 - 2.0 * k)).min(cap)
             } else {
-                near.iter()
-                    .min_by(|a, b| d(a).total_cmp(&d(b)))
-                    .map(|p| p[2])
-                    .unwrap_or(fallback)
+                smooth.min(cap)
             };
-            t.heights[iy * n + ix] = (h - 0.3) as f32;
+            t.heights[iy * n + ix] = h as f32;
         }
     }
     t
